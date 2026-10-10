@@ -56,14 +56,20 @@ def ensure_image(image: str) -> None:
         raise LocalModeError(f"could not pull {image}") from exc
 
 
-def stage_source_dir(destination: Path) -> Path:
-    """Copy the package and an entry script into a directory SageMaker can upload or mount."""
-    package_dir = Path(fraud_scoring.__file__).parent
+def copy_package(destination: Path) -> Path:
+    """Copy this package to ``<destination>/fraud_scoring`` so a container can import it."""
+    target = destination / "fraud_scoring"
     shutil.copytree(
-        package_dir,
-        destination / "fraud_scoring",
+        Path(fraud_scoring.__file__).parent,
+        target,
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
+    return target
+
+
+def stage_source_dir(destination: Path) -> Path:
+    """Copy the package and an entry script into a directory SageMaker can upload or mount."""
+    copy_package(destination)
     (destination / ENTRY_SCRIPT).write_text(ENTRY_SHIM)
     return destination
 

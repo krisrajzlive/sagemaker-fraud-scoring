@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from fraud_scoring.data import split_by_time, write_splits
+from fraud_scoring.entrypoints.train import main as train_main
 from fraud_scoring.schema import RAW_COLUMNS, TARGET, V_COLUMNS
 
 
@@ -43,3 +44,19 @@ def processed_dir(tmp_path: Path, transactions: pd.DataFrame) -> Path:
     out = tmp_path / "processed"
     write_splits(split_by_time(transactions), out, dataset_sha256="synthetic")
     return out
+
+
+@pytest.fixture
+def trained_model(processed_dir, tmp_path):
+    model_dir = tmp_path / "jobs" / "job-1" / "model"
+    train_main(
+        [
+            "--train", str(processed_dir / "train"),
+            "--validation", str(processed_dir / "validation"),
+            "--model-dir", str(model_dir),
+            "--output-dir", str(tmp_path / "out"),
+            "--epochs", "6",
+            "--hidden-dims", "16,8",
+        ]
+    )  # fmt: skip
+    return model_dir

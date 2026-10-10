@@ -179,3 +179,170 @@ def evaluate(
         f"(TP {at['tp']}, FP {at['fp']}, FN {at['fn']})"
     )
     console.print(f"saved {model_dir.parent / 'evaluation.json'}")
+
+
+def _resolve_model_dir(model_dir: Path | None) -> Path:
+    from fraud_scoring.launcher import LocalModeError, latest_model_dir
+
+    try:
+        return model_dir or latest_model_dir(get_settings().jobs_dir)
+    except LocalModeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+
+def _format_probability(value: float) -> str:
+    return f"{value:.4f}" if value >= 1e-4 else f"{value:.1e}"
+
+
+@app.command()
+def predict(
+    file: Annotated[
+        Path | None,
+        typer.Option(help='JSON file: a list of transactions or {"instances": [...]}.'),
+    ] = None,
+    sample: Annotated[
+        int, typer.Option(help="Real test-split transactions to score when --file is not given.")
+    ] = 6,
+    frauds: Annotated[int, typer.Option(help="How many of the sampled ones are known frauds.")] = 2,
+    seed: Annotated[int, typer.Option(help="Seed for choosing the sample.")] = 7,
+    url: Annotated[
+        str | None,
+        typer.Option(help="Use a running endpoint (see `serve`) instead of starting a new one."),
+    ] = None,
+    model_dir: Annotated[
+        Path | None, typer.Option(help="Defaults to the latest local training job.")
+    ] = None,
+    port: Annotated[int, typer.Option(help="Port for the temporary endpoint.")] = 8080,
+) -> None:
+    """Send transactions to a real-time endpoint and show the fraud scores.
+
+    Without --url this starts the model in the AWS inference container (about 30 seconds),
+    scores, and shuts it down again.
+    """
+    from fraud_scoring.client import EndpointError, invoke
+    from fraud_scoring.launcher import LocalModeError
+    from fraud_scoring.samples import sample_transactions
+    from fraud_scoring.serving import LocalEndpoint
+
+    settings = get_settings()
+    labels: list[int] | None = None
+    if file is not None:
+        payload = json.loads(file.read_text())
+        instances = payload["instances"] if isinstance(payload, dict) else payload
+    else:
+        test_dir = settings.processed_dir / "test"
+        if not test_dir.is_dir():
+            console.print(f"[red]{test_dir} not found; run `fraud-scoring data prepare`[/red]")
+            raise typer.Exit(1)
+        instances, labels = sample_transactions(test_dir, count=sample, frauds=frauds, seed=seed)
+
+    try:
+        if url:
+            result = invoke(url, instances)
+        else:
+            endpoint = LocalEndpoint(
+                _resolve_model_dir(model_dir),
+                settings.inference_image,
+                port=port,
+                region=settings.aws_region,
+                log_path=settings.artifact_dir / "serving" / f"endpoint-{port}.log",
+            )
+            with console.status("starting the SageMaker inference container..."):
+                endpoint.start()
+            try:
+                result = invoke(endpoint.url, instances)
+            finally:
+                with console.status("stopping the endpoint..."):
+                    endpoint.stop()
+    except (EndpointError, LocalModeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    predictions = result["predictions"]
+    table = Table(title=f"fraud scores (flag when probability >= {result['threshold']:.4f})")
+    columns = ["#", "Amount", "fraud probability", "decision"]
+    if labels is not None:
+        columns.insert(2, "actual")
+    for column in columns:
+        table.add_column(column, justify="left" if column in ("decision", "actual") else "right")
+    correct = 0
+    for index, (instance, prediction) in enumerate(zip(instances, predictions, strict=True)):
+        flagged = prediction["flagged"]
+        row = [str(index + 1), f"{instance['Amount']:,.2f}"]
+        if labels is not None:
+            row.append("FRAUD" if labels[index] else "legit")
+            correct += int(bool(labels[index]) == flagged)
+        row += [
+            _format_probability(prediction["fraud_probability"]),
+            "[red]FLAGGED[/red]" if flagged else "ok",
+        ]
+        table.add_row(*row)
+    console.print(table)
+    flagged_count = sum(p["flagged"] for p in predictions)
+    summary = f"{flagged_count} of {len(predictions)} flagged"
+    if labels is not None:
+        summary += f"; {correct} of {len(labels)} decisions match the true label"
+    console.print(summary)
+
+
+@app.command()
+def serve(
+    model_dir: Annotated[
+        Path | None, typer.Option(help="Defaults to the latest local training job.")
+    ] = None,
+    port: Annotated[int, typer.Option(help="Host port for the endpoint.")] = 8080,
+    workers: Annotated[int, typer.Option(help="TorchServe workers (each loads PyTorch).")] = 2,
+) -> None:
+    """Run the model as a local real-time endpoint until you press Ctrl+C."""
+    import os
+    import time
+
+    from fraud_scoring.launcher import LocalModeError
+    from fraud_scoring.samples import sample_transactions
+    from fraud_scoring.serving import LocalEndpoint
+
+    settings = get_settings()
+    serving_dir = settings.artifact_dir / "serving"
+    endpoint = LocalEndpoint(
+        _resolve_model_dir(model_dir),
+        settings.inference_image,
+        port=port,
+        workers=workers,
+        region=settings.aws_region,
+        log_path=serving_dir / f"endpoint-{port}.log",
+    )
+    try:
+        with console.status("starting the SageMaker inference container (about 30 s)..."):
+            endpoint.start()
+    except LocalModeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    try:
+        console.print(
+            f"[green]endpoint ready[/green] at {endpoint.url}  (POST /invocations, GET /ping)"
+        )
+        console.print(f"container log: {endpoint.log_path}")
+        console.print("\nIn another terminal:")
+        console.print(f"  fraud-scoring predict --url {endpoint.url}")
+        test_dir = settings.processed_dir / "test"
+        if test_dir.is_dir():
+            instances, _ = sample_transactions(test_dir, count=3, frauds=1)
+            example = serving_dir / "example_request.json"
+            example.write_text(json.dumps({"instances": instances}, indent=2))
+            curl = "curl.exe" if os.name == "nt" else "curl"
+            console.print(
+                f"  {curl} -s -X POST {endpoint.url}/invocations "
+                f'-H "Content-Type: application/json" -d @{example}'
+            )
+        console.print("\nPress Ctrl+C to stop.")
+        while endpoint.alive():
+            time.sleep(1)
+        console.print("[red]the endpoint process exited unexpectedly[/red]")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        with console.status("stopping the endpoint and removing its container..."):
+            endpoint.stop()
+    console.print("stopped")
