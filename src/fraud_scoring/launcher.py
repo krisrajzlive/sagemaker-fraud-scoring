@@ -151,8 +151,12 @@ def launch_local_training(
 
 
 def latest_model_dir(jobs_dir: Path) -> Path:
-    """The model directory of the most recently started local training job."""
-    candidates = sorted(p for p in jobs_dir.glob("*/model") if (p / METADATA_FILE).exists())
+    """The model directory of the most recently trained job.
+
+    Ordered by when the artifact was written, not by job name: custom ``--job-name`` values
+    would otherwise sort ahead of or behind the timestamped defaults.
+    """
+    candidates = [p for p in jobs_dir.glob("*/model") if (p / METADATA_FILE).exists()]
     if not candidates:
         raise LocalModeError(f"no trained model under {jobs_dir}; run `fraud-scoring train`")
-    return candidates[-1]
+    return max(candidates, key=lambda p: (p / METADATA_FILE).stat().st_mtime_ns)

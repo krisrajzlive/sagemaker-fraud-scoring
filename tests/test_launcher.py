@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import os
 import subprocess
-from pathlib import Path
 
 import pytest
 
@@ -50,13 +50,20 @@ def test_ensure_docker_explains_each_failure(monkeypatch):
             ensure_docker()
 
 
-def test_latest_model_dir_picks_the_newest_complete_job(tmp_path):
-    for job, complete in (("job-1", True), ("job-2", True), ("job-3", False)):
+def test_latest_model_dir_picks_the_most_recently_trained_job_regardless_of_name(tmp_path):
+    # (job name, age in seconds, finished?) - the newest finished job sorts first by name, and
+    # an unfinished job (no metadata.json) is newer still but must be ignored.
+    jobs = (("a-newest", 10, True), ("m-middle", 500, True), ("z-oldest", 9000, True))
+    jobs += (("b-unfinished", 1, False),)
+    now = 2_000_000_000
+    for job, age, finished in jobs:
         model = tmp_path / job / "model"
         model.mkdir(parents=True)
-        if complete:
-            (model / "metadata.json").write_text("{}")
-    assert latest_model_dir(tmp_path) == Path(tmp_path / "job-2" / "model")
+        if finished:
+            metadata = model / "metadata.json"
+            metadata.write_text("{}")
+            os.utime(metadata, (now - age, now - age))
+    assert latest_model_dir(tmp_path) == tmp_path / "a-newest" / "model"
 
 
 def test_latest_model_dir_without_jobs_points_at_the_train_command(tmp_path):
