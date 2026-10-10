@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+
+# Secrets and local config: never commit
+.env
+.env.*
+!.env.example
+*.pem
+.aws/
+credentials*
+
+# Downloaded dataset, processed splits, and everything training or serving produces
+data/raw/
+data/processed/
+artifacts/
