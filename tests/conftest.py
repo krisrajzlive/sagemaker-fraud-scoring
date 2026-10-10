@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import numpy as np
@@ -60,3 +63,40 @@ def trained_model(processed_dir, tmp_path):
         ]
     )  # fmt: skip
     return model_dir
+
+
+class FakeEndpoint(BaseHTTPRequestHandler):
+    """A stand-in for the real endpoint: flags amounts above 100, rejects negative ones (400)."""
+
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):  # noqa: N802
+        payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        rows = payload["instances"]
+        if any(row["Amount"] < 0 for row in rows):
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(
+                b'{"error": "Amount must be non-negative"}\nTraceback (most recent call last)'
+            )
+            return
+        predictions = [
+            {
+                "fraud_probability": 0.99 if row["Amount"] > 100 else 0.01,
+                "flagged": row["Amount"] > 100,
+            }
+            for row in rows
+        ]
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(json.dumps({"predictions": predictions, "threshold": 0.5}).encode())
+
+
+@pytest.fixture
+def endpoint_url():
+    httpd = HTTPServer(("127.0.0.1", 0), FakeEndpoint)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{httpd.server_port}"
+    httpd.shutdown()
+    httpd.server_close()

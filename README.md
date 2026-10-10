@@ -123,6 +123,41 @@ bodies; the `predict` command shows only the message.
 The latency figures describe this machine only (loopback to a container in the Docker Desktop VM);
 they say nothing about any AWS instance type.
 
+### Try your own values
+
+The model scores numbers, not text, so there is no free-form prompt: a transaction is `Time`,
+`V1`..`V28` (anonymised PCA components) and `Amount`. `try` is an interactive what-if. It starts from
+a typical legitimate transaction, or a real one from the test split, and re-scores after every edit:
+
+```bash
+uv run fraud-scoring try                          # starts the container (about 30 s), then prompts
+uv run fraud-scoring try --url http://127.0.0.1:8080   # reuse an endpoint left running by `serve`
+```
+
+```
+try> V14=-4
+fraud probability 0.3996  [############................|.]  ok
+try> V14=-8 V12=-7
+fraud probability 0.9766  [############################|.]  FLAGGED as fraud
+try> reset
+fraud probability 0.0156  [............................|.]  ok
+try> Amount=25000 hour=3
+fraud probability 0.0003  [............................|.]  ok
+try> random fraud
+loaded a real test-split transaction (actually FRAUD)
+fraud probability 0.9989  [############################|#]  FLAGGED as fraud
+```
+
+Besides `NAME=VALUE`, you can paste a JSON object, `show` what you changed, `reset`, and load
+`random fraud` or `random legit` real transactions (the true label is printed locally, never sent).
+
+What moves the score, measured one field at a time on the median legitimate transaction (score
+0.016; the median fraud scores 0.994): `V14` and `V12` are the strong levers (`V14` at -4 / -8 / -15
+gives 0.40 / 0.80 / 0.97), `V4` helps a little, and `Amount` and the hour barely matter. A $25,000
+purchase scores *lower* (0.0005) than a $50 one (0.014), so typing a large amount does not flag
+anything. These are model sensitivities on one synthetic starting point, not statements about
+real-world fraud: the V fields are anonymised, so their meaning is unknown.
+
 ## How it maps to SageMaker
 
 | This repo | SageMaker concept |
@@ -160,7 +195,7 @@ Found while building this; each has a workaround in the code.
 
 ```bash
 uv run ruff check . && uv run ruff format --check .
-uv run pytest -q                 # 106 tests, no Docker or dataset needed
+uv run pytest -q                 # 140 tests, no Docker or dataset needed
 uv run pytest -m docker -q       # 4 tests: trains and serves for real in the AWS containers
 ```
 
@@ -174,7 +209,7 @@ history. The Docker tests are not in CI yet.
 | PyTorch script-mode training in the official AWS container | **Ran** (SageMaker local mode, Docker) and covered by a Docker test |
 | Chronological split, leakage-safe preprocessing, early stopping | **Ran** |
 | Held-out evaluation with bootstrap intervals and baselines | **Ran** |
-| Real-time inference in the official AWS inference container (`predict`, `serve`) | **Ran** (SageMaker local mode, Docker) and covered by Docker tests |
+| Real-time inference in the official AWS inference container (`predict`, `serve`, `try`) | **Ran** (SageMaker local mode, Docker) and covered by Docker tests |
 | Hyperparameter search, model registry, JumpStart catalog | Not built yet |
 | SageMaker Pipeline definition, CloudFormation, AWS deployment | Not built yet; will be validated offline only |
 | Managed training job / endpoint on AWS | **Never run** (needs an AWS account with a SageMaker execution role) |

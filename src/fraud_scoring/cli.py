@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Annotated
 
@@ -195,6 +197,31 @@ def _format_probability(value: float) -> str:
     return f"{value:.4f}" if value >= 1e-4 else f"{value:.1e}"
 
 
+@contextmanager
+def _serving(url: str | None, model_dir: Path | None, port: int) -> Iterator[str]:
+    """Yield the base URL of a running endpoint: the one given, or a temporary local one."""
+    from fraud_scoring.serving import LocalEndpoint
+
+    if url:
+        yield url
+        return
+    settings = get_settings()
+    endpoint = LocalEndpoint(
+        _resolve_model_dir(model_dir),
+        settings.inference_image,
+        port=port,
+        region=settings.aws_region,
+        log_path=settings.artifact_dir / "serving" / f"endpoint-{port}.log",
+    )
+    with console.status("starting the SageMaker inference container (about 30 s)..."):
+        endpoint.start()
+    try:
+        yield endpoint.url
+    finally:
+        with console.status("stopping the endpoint..."):
+            endpoint.stop()
+
+
 @app.command()
 def predict(
     file: Annotated[
@@ -223,7 +250,6 @@ def predict(
     from fraud_scoring.client import EndpointError, invoke
     from fraud_scoring.launcher import LocalModeError
     from fraud_scoring.samples import sample_transactions
-    from fraud_scoring.serving import LocalEndpoint
 
     settings = get_settings()
     labels: list[int] | None = None
@@ -238,23 +264,8 @@ def predict(
         instances, labels = sample_transactions(test_dir, count=sample, frauds=frauds, seed=seed)
 
     try:
-        if url:
-            result = invoke(url, instances)
-        else:
-            endpoint = LocalEndpoint(
-                _resolve_model_dir(model_dir),
-                settings.inference_image,
-                port=port,
-                region=settings.aws_region,
-                log_path=settings.artifact_dir / "serving" / f"endpoint-{port}.log",
-            )
-            with console.status("starting the SageMaker inference container..."):
-                endpoint.start()
-            try:
-                result = invoke(endpoint.url, instances)
-            finally:
-                with console.status("stopping the endpoint..."):
-                    endpoint.stop()
+        with _serving(url, model_dir, port) as base_url:
+            result = invoke(base_url, instances)
     except (EndpointError, LocalModeError) as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
@@ -326,6 +337,7 @@ def serve(
         console.print(f"container log: {endpoint.log_path}")
         console.print("\nIn another terminal:")
         console.print(f"  fraud-scoring predict --url {endpoint.url}")
+        console.print(f"  fraud-scoring try --url {endpoint.url}    (type your own values)")
         test_dir = settings.processed_dir / "test"
         if test_dir.is_dir():
             instances, _ = sample_transactions(test_dir, count=3, frauds=1)
@@ -346,3 +358,138 @@ def serve(
         with console.status("stopping the endpoint and removing its container..."):
             endpoint.stop()
     console.print("stopped")
+
+
+@app.command("try")
+def try_model(
+    url: Annotated[
+        str | None,
+        typer.Option(help="Use a running endpoint (see `serve`) instead of starting a new one."),
+    ] = None,
+    model_dir: Annotated[
+        Path | None, typer.Option(help="Defaults to the latest local training job.")
+    ] = None,
+    port: Annotated[int, typer.Option(help="Port for the temporary endpoint.")] = 8080,
+) -> None:
+    """Type field values and watch the fraud score change (an interactive what-if).
+
+    The model scores numbers, not text: V1..V28 (anonymised), Amount and Time. Start from a
+    typical transaction or a real one from the test split, then change any field.
+    """
+    import secrets
+
+    from rich.markup import escape
+
+    from fraud_scoring.client import EndpointError, invoke
+    from fraud_scoring.data import read_split
+    from fraud_scoring.explore import (
+        FIELD_BY_LOWER_NAME,
+        HELP,
+        CommandError,
+        Session,
+        format_score,
+        parse_assignments,
+        parse_json_fields,
+        typical_transaction,
+    )
+    from fraud_scoring.launcher import LocalModeError
+    from fraud_scoring.samples import sample_transactions
+
+    processed = get_settings().processed_dir
+    if not (processed / "train").is_dir() or not (processed / "test").is_dir():
+        console.print(f"[red]{processed} not found; run `fraud-scoring data prepare`[/red]")
+        raise typer.Exit(1)
+    session = Session(
+        typical_transaction(read_split(processed / "train")),
+        origin="a typical legitimate transaction (the median of each field)",
+    )
+
+    def score(base_url: str) -> None:
+        try:
+            result = invoke(base_url, [session.current])
+        except EndpointError as exc:
+            console.print(
+                f"[red]the endpoint rejected this transaction:[/red] {escape(exc.detail)}"
+            )
+            return
+        prediction, threshold = result["predictions"][0], result["threshold"]
+        probability = prediction["fraud_probability"]
+        verdict = "[red]FLAGGED as fraud[/red]" if prediction["flagged"] else "[green]ok[/green]"
+        console.print(
+            f"fraud probability [bold]{_format_probability(probability)}[/bold]  "
+            f"{escape(format_score(probability, threshold))}  {verdict}"
+        )
+
+    def show(everything: bool) -> None:
+        changes = session.changed()
+        if everything:
+            for name, value in session.current.items():
+                console.print(f"  {name:6s} {value:>14,.4f}", highlight=False)
+        elif changes:
+            for name, (before, now) in changes.items():
+                console.print(f"  {name:6s} {before:>12,.4f} -> {now:,.4f}", highlight=False)
+        else:
+            console.print(f"  no changes yet; starting from {session.origin}")
+
+    def repl(base_url: str) -> None:
+        console.print(f"Starting from {session.origin}.")
+        console.print(HELP, markup=False, highlight=False)
+        console.print()
+        score(base_url)
+        while True:
+            try:
+                line = input("try> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print()
+                return
+            if not line:
+                continue
+            head, _, rest = line.partition(" ")
+            word = head.lower()
+            try:
+                if word in ("quit", "exit", "q"):
+                    return
+                if word == "help":
+                    console.print(HELP, markup=False, highlight=False)
+                elif word == "show":
+                    show(rest.strip().lower() == "all")
+                elif word == "reset":
+                    session.reset()
+                    score(base_url)
+                elif word == "random":
+                    kind = rest.strip().lower()
+                    if kind not in ("fraud", "legit"):
+                        raise CommandError("use 'random fraud' or 'random legit'")
+                    instances, labels = sample_transactions(
+                        processed / "test",
+                        count=1,
+                        frauds=1 if kind == "fraud" else 0,
+                        seed=secrets.randbelow(2**31),
+                    )
+                    truth = "FRAUD" if labels[0] else "legitimate"
+                    session.load(instances[0], f"a real test-split transaction (actually {truth})")
+                    console.print(f"loaded {session.origin}")
+                    score(base_url)
+                elif line.startswith("{"):
+                    session.apply(parse_json_fields(line))
+                    score(base_url)
+                elif word == "set":
+                    session.apply(parse_assignments(rest))
+                    score(base_url)
+                elif "=" in line:
+                    session.apply(parse_assignments(line))
+                    score(base_url)
+                elif word == "hour" or word in FIELD_BY_LOWER_NAME:
+                    name = "hour" if word == "hour" else FIELD_BY_LOWER_NAME[word]
+                    raise CommandError(f"to change {name}, type {name}=VALUE, e.g. {name}=5")
+                else:
+                    raise CommandError(f"unknown command {head!r}; type help")
+            except CommandError as exc:
+                console.print(f"[red]{escape(str(exc))}[/red]")
+
+    try:
+        with _serving(url, model_dir, port) as base_url:
+            repl(base_url)
+    except (EndpointError, LocalModeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
